@@ -1,42 +1,132 @@
 from fastapi import APIRouter
-import time, random
+import time
 from api.schemas.request import TransactionRequest
 from api.schemas.response import TransactionResponse, AgentVote
-from core.constants import Decision, RISK_THRESHOLDS
 from core.logger import logger
+from orchestration.pipeline import FraudDetectionPipeline
 
 router = APIRouter()
 
+# Initialize pipeline once
+pipeline = FraudDetectionPipeline()
+
 @router.post("/transaction/evaluate", response_model=TransactionResponse)
 def evaluate_transaction(request: TransactionRequest):
-    start = time.time()
+    """
+    Evaluates a transaction for fraud using the multi-agent pipeline.
     
-    # --- MOCK MULTI-AGENT PIPELINE (Member 1 & 2 will replace this) ---
-    rule_score = 0.9 if request.amount > 5000 else 0.2
-    anomaly_score = random.uniform(0.5, 0.9) if "new" in (request.location or "").lower() else random.uniform(0.1, 0.4)
-    graph_score = 0.7 if request.metadata.get("rapid") else 0.1
+    The pipeline:
+    1. Ingests and validates transaction data
+    2. Engineers features from raw data
+    3. Runs 3 parallel detection agents (rule-based, anomaly, graph)
+    4. Coordinates results using voting and priority rules
+    5. Scores risk using weighted aggregation
+    6. Makes final decision (approve/flag/block/escalate)
+    7. Records feedback for continuous learning
     
-    # Coordinator Agent - Weighted Scoring
-    risk_score = round(rule_score*0.4 + anomaly_score*0.4 + graph_score*0.2, 3)
+    Args:
+        request: TransactionRequest with transaction details
+        
+    Returns:
+        TransactionResponse with decision, risk score, and agent votes
+    """
+    start_time = time.time()
     
-    if risk_score >= RISK_THRESHOLDS[Decision.BLOCK]: decision = Decision.BLOCK
-    elif risk_score >= RISK_THRESHOLDS[Decision.ESCALATE]: decision = Decision.ESCALATE
-    elif risk_score >= RISK_THRESHOLDS[Decision.FLAG]: decision = Decision.FLAG
-    else: decision = Decision.APPROVE
+    try:
+        logger.info(f"API: Processing transaction {request.transaction_id}")
+        
+        # Convert request to dict for pipeline
+        transaction_dict = request.model_dump()
+        
+        # Optional: Add user history (can be fetched from database)
+        # For now, we'll use empty history - in production, fetch from DB
+        user_history = {
+            "recent_transactions": [],
+            "last_location": request.location,
+            "avg_transaction_amount": 100,
+            "known_devices": [],
+        }
+        
+        # Execute pipeline
+        pipeline_result = pipeline.process_transaction(transaction_dict, user_history)
+        
+        # Extract and format response
+        response = TransactionResponse(
+            transaction_id=pipeline_result["transaction_id"],
+            risk_score=pipeline_result["risk_score"],
+            decision=pipeline_result["decision"],
+            explanation=pipeline_result["explanation"],
+            agent_votes=[
+                AgentVote(
+                    agent=vote["agent"],
+                    score=vote["score"],
+                    reason=vote["reason"]
+                )
+                for vote in pipeline_result["agent_votes"]
+            ],
+            processing_time_ms=pipeline_result["processing_time_ms"],
+        )
+        
+        logger.info(
+            f"API: Transaction {request.transaction_id} evaluated - "
+            f"Decision: {response.decision}, Risk: {response.risk_score}, "
+            f"Time: {response.processing_time_ms:.2f}ms"
+        )
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"API: Failed to evaluate transaction {request.transaction_id} - {str(e)}")
+        raise
 
-    votes = [
-        AgentVote(agent="rule_based", score=rule_score, reason="High amount rule"),
-        AgentVote(agent="anomaly_detection", score=anomaly_score, reason="IsolationForest"),
-        AgentVote(agent="graph_analysis", score=graph_score, reason="Velocity check"),
-    ]
+
+@router.post("/transaction/batch-evaluate")
+def batch_evaluate_transactions(requests: list[TransactionRequest]):
+    """
+    Evaluates multiple transactions in batch.
     
-    logger.info(f"TXN {request.transaction_id} -> {decision} ({risk_score})")
+    Args:
+        requests: List of TransactionRequest objects
+        
+    Returns:
+        List of TransactionResponse objects
+    """
+    try:
+        logger.info(f"API: Batch processing {len(requests)} transactions")
+        
+        results = []
+        for request in requests:
+            response = evaluate_transaction(request)
+            results.append(response)
+        
+        logger.info(f"API: Batch processing complete - {len(results)} transactions evaluated")
+        
+        return {
+            "total": len(results),
+            "results": results,
+        }
+        
+    except Exception as e:
+        logger.error(f"API: Batch evaluation failed - {str(e)}")
+        raise
+
+
+@router.get("/transaction/pipeline-status")
+def get_pipeline_status():
+    """
+    Gets the status of all agents in the pipeline.
     
-    return TransactionResponse(
-        transaction_id=request.transaction_id,
-        risk_score=risk_score,
-        decision=decision,
-        explanation=f"Aggregated from 3 agents. Rule={rule_score}, Anomaly={anomaly_score}",
-        agent_votes=votes,
-        processing_time_ms=round((time.time()-start)*1000, 2)
-    )
+    Returns:
+        Dict with status of each agent
+    """
+    try:
+        status = pipeline.get_pipeline_status()
+        
+        return {
+            "pipeline_status": "healthy",
+            "agents": status,
+        }
+        
+    except Exception as e:
+        logger.error(f"API: Failed to get pipeline status - {str(e)}")
+        raise
